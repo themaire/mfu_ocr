@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import time
 from pathlib import Path
 
 from rich.console import Console
@@ -51,6 +53,7 @@ def process_pdf_command(
     json_output_path: Path | None = typer.Option(None, "--json-output", help="Fichier JSON de synthèse"),
 ) -> None:
     """Traite un PDF hybride : texte natif si possible, OCR sinon."""
+    t0 = time.monotonic()
     text, analysis_text = process_pdf(pdf_path, language=language, return_analysis=True)
     if not text:
         console.print("[red]Aucun texte n'a pu être extrait du document.[/red]")
@@ -60,7 +63,15 @@ def process_pdf_command(
     metadata = extract_document_metadata(analysis_text, pdf_path.name)
     json_target = write_metadata_json(metadata, json_output_path or output_path.with_suffix(".json"))
 
-    console.print(f"[green]Traitement terminé. Sortie texte :[/green] {target}")
+    # Insérer le JSON au début du fichier texte
+    json_block = json.dumps(metadata, indent=2, ensure_ascii=False)
+    separator = "\n" + "=" * 72 + "\n\n"
+    original_text = target.read_text(encoding="utf-8")
+    target.write_text(json_block + separator + original_text, encoding="utf-8")
+
+    elapsed = time.monotonic() - t0
+    minutes, seconds = divmod(elapsed, 60)
+    console.print(f"[green]Traitement terminé en {int(minutes)}m{seconds:05.2f}s. Sortie texte :[/green] {target}")
     console.print(f"[green]Synthèse JSON :[/green] {json_target}")
 
 

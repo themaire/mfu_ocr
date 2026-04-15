@@ -60,8 +60,14 @@ def detect_document_type(text: str) -> dict[str, str | None]:
 
 
 def _clean_commune_candidate(candidate: str) -> str:
+    # Tronquer au premier séparateur " - " AVANT normalisation
+    candidate = re.split(r"\s+-\s+|\s+—\s+", candidate)[0].strip()
     cleaned = _normalize_label(candidate)
     cleaned = re.split(r"\(|,|;|\.", cleaned)[0].strip(" -")
+    # Supprimer les caractères parasites en début (artefacts OCR)
+    cleaned = re.sub(r"^[^A-ZÀ-Ÿa-zà-ÿ]+", "", cleaned)
+    # Supprimer les mots courts isolés en préfixe (1-2 lettres + bruit)
+    cleaned = re.sub(r"^[A-ZÀ-Ÿa-zà-ÿ]{1,2}\s+[^A-ZÀ-Ÿa-zà-ÿ\s].*?\s+", "", cleaned)
 
     stop_markers = [
         " AU CONSERVATOIRE",
@@ -90,7 +96,7 @@ def _score_commune_candidate(candidate: str) -> tuple[int, int, int]:
     if 4 <= len(candidate) <= 40:
         bonus += 3
 
-    return (bonus + penalty, candidate.count("-"), -len(candidate))
+    return (bonus + penalty, 1 if "-" in candidate else 0, -len(candidate))
 
 
 def extract_commune(text: str) -> str | None:
@@ -221,9 +227,60 @@ def extract_document_metadata(text: str, source_filename: str) -> dict[str, obje
         metadata["document_type"] = detected_type["document_type"]
 
     metadata["document_type_label"] = detected_type.get("document_type_label")
-    metadata["commune"] = extract_commune(text)
-    metadata["cadastral_parcels"] = extract_cadastral_parcels(text)
+
+    # Extraction brute depuis l'OCR
+    raw_commune = extract_commune(text)
+    raw_parcels = extract_cadastral_parcels(text)
+
+    # Validation via l'API IGN
+    commune_info = _validate_commune(raw_commune)
+    if commune_info:
+        metadata["commune"] = commune_info["nom"]
+        metadata["code_insee"] = commune_info["code"]
+    else:
+        metadata["commune"] = raw_commune
+        metadata["code_insee"] = None
+
+    # Validation des parcelles si on a un code INSEE
+    code_insee = metadata.get("code_insee")
+    if code_insee and raw_parcels:
+        validated = _validate_parcels(code_insee, raw_parcels)
+        # Ne garder que les parcelles confirmées par l'IGN
+        confirmed = [p for p in validated if p.get("ign_verified") is True]
+        metadata["cadastral_parcels"] = confirmed if confirmed else validated
+    else:
+        metadata["cadastral_parcels"] = [
+            {**p, "ign_verified": None} for p in raw_parcels
+        ]
+
     return metadata
+
+
+def _validate_commune(raw_commune: str | None) -> dict[str, str] | None:
+    """Valide un nom de commune OCR via l'API geo.api.gouv.fr."""
+    if not raw_commune:
+        return None
+    try:
+        from ocr_hailo.geo_api import match_commune
+        result = match_commune(raw_commune)
+        return result
+    except Exception as exc:
+        import sys
+        print(f"[WARN] Validation commune échouée: {exc}", file=sys.stderr)
+        return None
+
+
+def _validate_parcels(
+    code_insee: str, parcels: list[dict[str, str]],
+) -> list[dict[str, object]]:
+    """Vérifie les parcelles via l'API Carto IGN."""
+    try:
+        from ocr_hailo.geo_api import verify_parcelles_batch
+        return verify_parcelles_batch(code_insee, parcels)
+    except Exception as exc:
+        import sys
+        print(f"[WARN] Validation parcelles échouée: {exc}", file=sys.stderr)
+        return [{**p, "ign_verified": None} for p in parcels]
 
 
 def write_metadata_json(metadata: dict[str, object], output_path: str | Path) -> Path:

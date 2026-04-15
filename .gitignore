@@ -11,3 +11,5 @@ data/raw/
 data/tmp/
 *.log
 .env
+./input/
+./output/

@@ -8,6 +8,8 @@ from PIL import Image, ImageFilter, ImageOps
 from pypdf import PdfReader
 import pytesseract
 
+from ocr_hailo.table_detection import detect_table_regions, remove_table_lines
+
 
 def extract_digital_text(pdf_path: str | Path) -> str:
     """Extrait le texte présent nativement dans un PDF."""
@@ -171,21 +173,138 @@ def _ocr_page(image: Image.Image, language: str = "fra") -> tuple[str, list[str]
     return unique_candidates[0], unique_candidates
 
 
+def _ocr_table_image(image: Image.Image, language: str = "fra") -> str:
+    """OCR optimisé pour une image de tableau dont les bordures ont été effacées."""
+    gray = ImageOps.grayscale(image) if image.mode != "L" else image
+    gray = ImageOps.autocontrast(gray)
+    sharp = gray.filter(ImageFilter.SHARPEN)
+
+    best_text = ""
+    best_score = (-1,)
+    for psm in [3, 4, 6]:
+        config = f"--oem 1 --psm {psm} -c preserve_interword_spaces=1"
+        text = pytesseract.image_to_string(sharp, lang=language, config=config).strip()
+        if text:
+            score = _score_ocr_text(text)
+            if score > best_score:
+                best_score = score
+                best_text = text
+    return best_text
+
+
+_SKIP_PATTERNS: list[re.Pattern[str]] | None = None
+_SKIP_CONFIG = Path(__file__).resolve().parent.parent.parent / "config" / "skip_pages.txt"
+
+
+def _load_skip_patterns() -> list[re.Pattern[str]]:
+    global _SKIP_PATTERNS
+    if _SKIP_PATTERNS is not None:
+        return _SKIP_PATTERNS
+    patterns: list[re.Pattern[str]] = []
+    if _SKIP_CONFIG.exists():
+        for line in _SKIP_CONFIG.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                patterns.append(re.compile(re.escape(line), re.IGNORECASE))
+    _SKIP_PATTERNS = patterns
+    return _SKIP_PATTERNS
+
+
+def _is_skip_page(image: Image.Image, language: str = "fra") -> str | None:
+    """OCR rapide basse résolution pour détecter les pages à ignorer.
+
+    Retourne le mot-clé trouvé ou None. Ignore les pages riches en texte
+    (le mot-clé y apparaît probablement dans une phrase, pas comme titre).
+    """
+    patterns = _load_skip_patterns()
+    if not patterns:
+        return None
+    small = image.resize((image.width // 4, image.height // 4), Image.Resampling.LANCZOS)
+    gray = ImageOps.grayscale(small)
+    gray = ImageOps.autocontrast(gray)
+    text = pytesseract.image_to_string(gray, lang=language, config="--oem 1 --psm 3").strip()
+
+    # Pages avec beaucoup de texte = contenu utile, ne pas ignorer
+    alnum = sum(1 for c in text if c.isalnum())
+    if alnum > 300:
+        return None
+
+    for pat in patterns:
+        if pat.search(text):
+            return pat.pattern.replace("\\", "")
+    return None
+
+
 def ocr_scanned_pdf(pdf_path: str | Path, language: str = "fra", return_analysis: bool = False) -> str | tuple[str, str]:
     """OCR fallback pour un PDF scanné via Poppler + Tesseract."""
     images = convert_from_path(str(pdf_path), dpi=400)
     blocks: list[str] = []
     analysis_blocks: list[str] = []
 
-    for index, image in enumerate(images, start=1):
-        text, candidates = _ocr_page(image, language=language)
-        if text:
-            blocks.append(f"--- Page {index} ---\n{_clean_ocr_text(text)}")
+    # Répertoire temporaire pour les tables extraites
+    pdf_stem = Path(pdf_path).stem
+    table_dir = Path(pdf_path).parent / "tables" / pdf_stem
 
-        if candidates:
-            top_candidates = candidates[:3]
-            merged_candidates = "\n\n".join(top_candidates)
-            analysis_blocks.append(f"--- Page {index} ---\n{merged_candidates}")
+    for index, image in enumerate(images, start=1):
+        # Pré-détection rapide → ignorer les pages inutiles (annexes, plans, cartes…)
+        skip_reason = _is_skip_page(image, language)
+        if skip_reason:
+            blocks.append(f"--- Page {index} --- [PAGE IGNORÉE : « {skip_reason} » détecté]")
+            continue
+
+        # Détecter les tableaux dans la page
+        table_regions = detect_table_regions(image)
+
+        if table_regions:
+            # Page avec tableau : OCR séparé pour les zones table vs hors-table
+            table_dir.mkdir(parents=True, exist_ok=True)
+            table_texts: list[str] = []
+
+            for t_idx, (x, y, cw, ch) in enumerate(table_regions, 1):
+                padding = 20
+                pw, ph = image.size
+                x0, y0 = max(0, x - padding), max(0, y - padding)
+                x1, y1 = min(pw, x + cw + padding), min(ph, y + ch + padding)
+
+                table_crop = image.crop((x0, y0, x1, y1))
+                cleaned = remove_table_lines(table_crop)
+                table_path = table_dir / f"page{index}_table{t_idx}.png"
+                cleaned.save(table_path)
+
+                table_text = _ocr_table_image(cleaned, language)
+                if table_text:
+                    table_texts.append(table_text)
+
+            # OCR du reste de la page (sans la zone tableau)
+            text, candidates = _ocr_page(image, language=language)
+            cleaned_text = _clean_ocr_text(text) if text else ""
+
+            # Assembler : texte de page + texte de table en section dédiée
+            page_parts = []
+            if cleaned_text:
+                page_parts.append(cleaned_text)
+            for t_text in table_texts:
+                page_parts.append(f"[TABLEAU DETECTE]\n{t_text}\n[FIN TABLEAU]")
+
+            if page_parts:
+                blocks.append(f"--- Page {index} ---\n" + "\n\n".join(page_parts))
+
+            # Pour l'analyse, combiner tous les candidats
+            all_analysis = []
+            if candidates:
+                all_analysis.extend(candidates[:2])
+            all_analysis.extend(table_texts)
+            if all_analysis:
+                analysis_blocks.append(f"--- Page {index} ---\n" + "\n\n".join(all_analysis))
+        else:
+            # Page sans tableau : pipeline standard
+            text, candidates = _ocr_page(image, language=language)
+            if text:
+                blocks.append(f"--- Page {index} ---\n{_clean_ocr_text(text)}")
+            if candidates:
+                top_candidates = candidates[:3]
+                merged_candidates = "\n\n".join(top_candidates)
+                analysis_blocks.append(f"--- Page {index} ---\n{merged_candidates}")
 
     result = "\n\n".join(blocks).strip()
     analysis_text = "\n\n".join(analysis_blocks).strip() or result

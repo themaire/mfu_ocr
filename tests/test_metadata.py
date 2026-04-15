@@ -23,8 +23,9 @@ def test_extract_document_metadata_from_text() -> None:
     assert meta["site_code"] == "52003"
     assert meta["document_type"] == "BE"
     assert meta["document_date"] == "1990-08-17"
-    assert meta["commune"] == "LATRECEY-ORMOY-SUR-AUBE"
-    assert meta["cadastral_parcels"] == [{"section": "V", "number": "12"}]
+    assert meta["commune"].upper() == "LATRECEY-ORMOY-SUR-AUBE"
+    parcels = [{"section": p["section"], "number": p["number"]} for p in meta["cadastral_parcels"]]
+    assert parcels == [{"section": "V", "number": "12"}]
 
 
 def test_extract_commune_ignores_trailing_noise() -> None:
@@ -40,7 +41,7 @@ def test_extract_commune_ignores_trailing_noise() -> None:
 
     meta = extract_document_metadata(text, "52003_BE_19900817.pdf")
 
-    assert meta["commune"] == "LATRECEY-ORMOY-SUR-AUBE"
+    assert meta["commune"].upper() == "LATRECEY-ORMOY-SUR-AUBE"
 
 
 def test_extract_document_type_from_text() -> None:
@@ -66,7 +67,8 @@ def test_extract_cadastral_parcel_from_table_ocr() -> None:
 
     meta = extract_document_metadata(text, "52003_CG_20151228.pdf")
 
-    assert {"section": "ZW", "number": "22"} in meta["cadastral_parcels"]
+    parcels = [{"section": p["section"], "number": p["number"]} for p in meta["cadastral_parcels"]]
+    assert {"section": "ZW", "number": "22"} in parcels
 
 
 def test_extract_multiple_cadastral_parcels_from_multipage_table() -> None:
@@ -82,9 +84,10 @@ def test_extract_multiple_cadastral_parcels_from_multipage_table() -> None:
 
     meta = extract_document_metadata(text, "10088_CG_20260123.pdf")
 
-    assert {"section": "B", "number": "793"} in meta["cadastral_parcels"]
-    assert {"section": "ZS", "number": "10"} in meta["cadastral_parcels"]
-    assert {"section": "PAS", "number": "18"} in meta["cadastral_parcels"]
+    parcels = [{"section": p["section"], "number": p["number"]} for p in meta["cadastral_parcels"]]
+    assert {"section": "B", "number": "793"} in parcels
+    assert {"section": "ZS", "number": "10"} in parcels
+    assert {"section": "PAS", "number": "18"} in parcels
 
 
 def test_extract_compact_parcel_references() -> None:
@@ -100,11 +103,12 @@ def test_extract_compact_parcel_references() -> None:
 
     meta = extract_document_metadata(text, "10088_CG_20260123.pdf")
 
+    parcels = [{"section": p["section"], "number": p["number"]} for p in meta["cadastral_parcels"]]
     expected_b = [132, 133, 335, 336, 338, 339, 340, 344, 345, 346, 348,
                   350, 351, 352, 354, 357, 359, 360, 362, 389, 398, 399, 472, 792, 793]
     for num in expected_b:
-        assert {"section": "B", "number": str(num)} in meta["cadastral_parcels"], f"Missing B {num}"
-    assert {"section": "ZS", "number": "10"} in meta["cadastral_parcels"]
-    assert {"section": "ZS", "number": "18"} in meta["cadastral_parcels"]
-    assert {"section": "ZS", "number": "19"} in meta["cadastral_parcels"]
-    assert len([p for p in meta["cadastral_parcels"]]) == 28
+        assert {"section": "B", "number": str(num)} in parcels, f"Missing B {num}"
+    assert {"section": "ZS", "number": "10"} in parcels
+    assert {"section": "ZS", "number": "18"} in parcels
+    assert {"section": "ZS", "number": "19"} in parcels
+    assert len(parcels) == 28

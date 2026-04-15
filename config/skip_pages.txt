@@ -1,0 +1,14 @@
+# Mots-clés pour ignorer des pages lors de l'OCR.
+# Une expression par ligne (insensible à la casse).
+# Les lignes vides et les commentaires (#) sont ignorés.
+# Attention : éviter les mots trop courts qui matcheraient dans le corps de texte.
+
+carte de localisation du site
+plan de localisation cadastral
+plan de localisation du parcellaire
+plan de situation
+annexe 1
+annexe 2
+annexe 3
+annexe 4
+annexe 5

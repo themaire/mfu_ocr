@@ -8,15 +8,32 @@ Mettre en place une chaîne d'extraction de texte pour des actes fonciers, capab
 
 La cible matérielle est un Raspberry Pi 5 équipé d'un Hailo AI HAT+ 26 TOPS.
 
-## Ce qui a été préparé
-Une base de projet Python a été initialisée pour démarrer la réflexion technique et les premiers essais :
-- structure de code dans `src/ocr_hailo/` ;
-- script de diagnostic de l'environnement ;
-- commande CLI de base ;
-- feuille de route dans `docs/roadmap.md` ;
-- export annexe au format JSON des données métier détectées.
+## Fonctionnalités
+
+### Pipeline OCR
+- OCR multi-passes avec Tesseract (2 variantes d'image × 3 configs PSM + reconstruction spatiale)
+- Détection et extraction de tableaux via OpenCV (morphologie) avec suppression des bordures
+- Nettoyage automatique du bruit OCR (artefacts de sidebar, logos, rafales de lignes courtes)
+- Exclusion configurable de pages inutiles (annexes, plans, cartes) via `config/skip_pages.txt`
+- Chronométrage intégré du temps de traitement
+
+### Extraction de métadonnées
+- Code site, type d'acte et date depuis le nom de fichier (ex : `52003_BE_19900817.pdf`)
+- Détection du type de document dans le texte (bail emphytéotique, convention de gestion…)
+- Extraction de la commune avec nettoyage des artefacts OCR
+- Extraction des parcelles cadastrales (tableaux, listes compactes type `B132 / B133 / ZS10`)
+
+### Validation IGN
+- Validation du nom de commune via l'API geo.api.gouv.fr (fuzzy matching + code INSEE)
+- Vérification de chaque parcelle via l'API Carto IGN (existence, contenance en hectares, bbox)
+- Filtrage automatique des faux positifs OCR grâce à la validation IGN
+
+### Sortie
+- Fichier `.txt` : JSON des métadonnées en en-tête + texte OCR complet
+- Fichier `.json` : métadonnées structurées avec parcelles enrichies (idu, contenance, bbox)
 
 ## Démarrage rapide
+
 ### 1) Créer l'environnement virtuel et installer les dépendances
 ```bash
 make install
@@ -27,90 +44,111 @@ make install
 make check-env
 ```
 
-### 3) Voir les commandes disponibles
-```bash
-make help
-```
-
-### 4) Lancer un premier traitement sur un PDF
-```bash
-PYTHONPATH=src .venv/bin/python -m ocr_hailo.cli process-pdf mon_document.pdf -o output/mon_document.txt
-```
-
-### 5) Exemple réel de test métier
-Convention de nommage d'un document :
-- `52003` : code site ;
-- `BE` : type d'acte, ici bail emphytéotique ;
-- `19900817` : date de l'acte au format AAAAMMJJ.
-
-Pour un fichier nommé `52003_BE_19900817.pdf` :
+### 3) Lancer un traitement sur un PDF
 ```bash
 PYTHONPATH=src .venv/bin/python -m ocr_hailo.cli process-pdf input/52003_BE_19900817.pdf -o output/52003_BE.txt
 ```
 
 Cette commande génère :
-- `output/52003_BE.txt` : texte OCRisé ;
-- `output/52003_BE.json` : synthèse structurée.
+- `output/52003_BE.txt` : métadonnées JSON + texte OCRisé
+- `output/52003_BE.json` : synthèse structurée avec validation IGN
 
-Commandes utiles de vérification :
+### 4) Vérifier le résultat
 ```bash
 cat output/52003_BE.json
 grep -ni "cadastr\|section" output/52003_BE.txt
 ```
 
-## Dépendances système utiles
-Pour aller plus loin sur les PDF scannés, il faudra disposer au minimum de :
-- `tesseract-ocr`
-- `tesseract-ocr-fra`
-- `poppler-utils`
-
-Exemple d'installation sur Debian / Raspberry Pi OS :
+## Dépendances système
 ```bash
 sudo apt update
 sudo apt install -y tesseract-ocr tesseract-ocr-fra poppler-utils
 ```
 
-## Structure actuelle
+Dépendances Python supplémentaires (installées automatiquement) :
+- `opencv-python-headless` — détection de tableaux
+- `numpy` — traitement d'image
+
+## Convention de nommage des fichiers
+```
+{code_site}_{type_acte}_{date}.pdf
+```
+- Code site : 5 chiffres (ex : `52003`, `10088`)
+- Type d'acte : 2+ lettres (ex : `BE` = bail emphytéotique, `CG` = convention de gestion)
+- Date : format AAAAMMJJ (ex : `19900817`)
+
+## Structure du projet
 ```text
 .
-├── README.md
-├── Makefile
-├── pyproject.toml
+├── config/
+│   └── skip_pages.txt          # Mots-clés pour ignorer des pages (annexes, plans…)
 ├── docs/
 │   └── roadmap.md
+├── input/                      # PDF à traiter
+├── javascript/
+│   └── geo_api.js              # Référence JS des appels API IGN
+├── output/                     # Résultats (.txt + .json)
 ├── scripts/
 │   └── check_env.py
-└── src/
-    └── ocr_hailo/
-        ├── __init__.py
-        ├── cli.py
-        ├── diagnostics.py
-        └── extraction.py
+├── src/
+│   └── ocr_hailo/
+│       ├── cli.py              # Interface CLI (typer)
+│       ├── diagnostics.py      # Diagnostic environnement
+│       ├── extraction.py       # Pipeline OCR (Tesseract + OpenCV)
+│       ├── geo_api.py          # Client API IGN / geo.api.gouv.fr
+│       ├── metadata.py         # Extraction métadonnées métier
+│       └── table_detection.py  # Détection de tableaux (OpenCV morphologie)
+├── tests/
+│   ├── test_diagnostics.py
+│   ├── test_extraction.py
+│   └── test_metadata.py       # 7 tests (parcelles, commune, type de doc)
+├── Makefile
+├── pyproject.toml
+└── README.md
 ```
 
-## Priorités métier à retenir
-Le but immédiat est d'obtenir un OCR le plus propre possible sur des actes parfois anciens et difficiles.
+## Exemple de sortie JSON
+```json
+{
+  "site_code": "10088",
+  "document_type": "CG",
+  "document_date": "2026-01-23",
+  "source_filename": "10088_CG_20260123.pdf",
+  "document_type_label": null,
+  "commune": "Neuville-sur-Vanne",
+  "code_insee": "10263",
+  "cadastral_parcels": [
+    {
+      "section": "0B",
+      "number": "132",
+      "ign_verified": true,
+      "idu": "102630000B0132",
+      "nom_com": "Neuville-sur-Vanne",
+      "contenance_ha": 0.3205,
+      "numero": "0132",
+      "bbox": "3.783663,48.26034575,3.78475852,48.26096594"
+    }
+  ]
+}
+```
 
-En complément, quelques repères métier simples sont extraits pour faciliter la relecture :
-1. le code site à partir du nom de fichier ;
-2. le nom de la commune mentionnée dans l'acte ;
-3. les références des parcelles cadastrales, point le plus important ;
-4. le type de document lorsqu'une mention explicite apparaît dans le texte, par exemple BAIL EMPHYTEOTIQUE.
+## Configuration du filtre de pages
+Le fichier `config/skip_pages.txt` permet d'ignorer les pages inutiles (annexes, cartes, plans).
+Une expression par ligne, insensible à la casse :
+```
+carte de localisation du site
+plan de localisation cadastral
+annexe 1
+annexe 2
+```
+Seules les pages pauvres en texte sont filtrées — une page de contenu mentionnant "Annexe 1" dans une phrase ne sera pas ignorée.
 
-Exemple observé sur un test réel : `Cadastrée Section V N° 12` dans le paragraphe `DESIGNATION DES BIENS LOUES`.
+## Tests
+```bash
+PYTHONPATH=src .venv/bin/pytest tests/ -v
+```
 
-Le JSON annexe vise justement à structurer ces informations sous forme exploitable :
-- code site ;
-- type d'acte ;
-- libellé du type trouvé dans le texte ;
-- date de l'acte ;
-- commune ;
-- parcelles cadastrales avec section et numéro.
-
-Une étape de toilettage par modèle local via LM Studio ou Ollama pourra venir plus tard, mais elle reste volontairement séparée du cœur OCR.
-
-## Prochaines étapes proposées
-1. fiabiliser encore l'extraction des références cadastrales ;
-2. tester sur plusieurs actes anciens de qualité variable ;
-3. ajouter des règles de post-traitement métier ;
-4. étudier ensuite la compatibilité d'un modèle OCR avec Hailo.
+## Prochaines étapes
+1. Exploiter le Hailo AI HAT+ pour la détection de layout documentaire (nécessite un modèle compilé sur x86)
+2. Étape de toilettage par modèle local via LM Studio / Ollama (séparée du cœur OCR)
+3. Traitement batch de dossiers complets
