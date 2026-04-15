@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ocr-hailo-pi"
+version = "0.1.0"
+description = "Base de travail pour un pipeline OCR sur Raspberry Pi 5 avec Hailo AI Hat+"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pypdf>=5.4.0",
+    "Pillow>=10.3.0",
+    "pdf2image>=1.17.0",
+    "pytesseract>=0.3.13",
+    "typer>=0.12.3",
+    "rich>=13.7.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.5",
+    "ruff>=0.11.0",
+]
+
+[project.scripts]
+ocr-hailo = "ocr_hailo.cli:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
