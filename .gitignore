@@ -11,5 +11,6 @@ data/raw/
 data/tmp/
 *.log
 .env
-./input/
-./output/
+./input/*
+./output/*
+config/ocr.code-workspace
