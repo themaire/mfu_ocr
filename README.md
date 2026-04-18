@@ -10,18 +10,84 @@ La cible matérielle est un Raspberry Pi 5 équipé d'un Hailo AI HAT+ 26 TOPS.
 
 ## Fonctionnalités
 
-### Pipeline OCR
-- OCR multi-passes avec Tesseract (2 variantes d'image × 3 configs PSM + reconstruction spatiale)
-- Détection et extraction de tableaux via OpenCV (morphologie) avec suppression des bordures
+### Pipeline OCR hybride (Hailo NPU + Tesseract)
+
+Le pipeline fonctionne en deux passes complémentaires sur chaque page :
+
+#### 1. Détection de zones de texte — Hailo NPU
+Le modèle PaddleOCR v5 Mobile Detection tourne sur le NPU Hailo-8 (26 TOPS) pour détecter
+les zones de texte (paragraphes, titres, mentions isolées) dans chaque page.
+Chaque zone est découpée (**crop**) et envoyée individuellement à Tesseract pour la
+reconnaissance de caractères.
+
+- Filtrage des zones trop petites (bruit : points, traits, caractères isolés)
+- Exclusion automatique des zones qui chevauchent un tableau détecté (pas de doublon)
+- Tri dans l'ordre de lecture (haut → bas, gauche → droite)
+- Mode debug (`--debug`) : sauvegarde des crops dans `input/crops/{pdf_stem}/`
+
+#### 2. Détection et extraction de tableaux — OpenCV
+Les tableaux sont détectés par analyse morphologique (OpenCV), indépendamment du Hailo :
+
+- Détection des régions tabulaires via contours morphologiques
+- Découpe (**crop**) de chaque tableau avec marge de sécurité
+- Suppression des bordures (lignes horizontales et verticales) pour isoler le contenu
+- Sauvegarde des crops nettoyés dans `input/tables/{pdf_stem}/`
+- OCR spécialisé avec **reconstruction spatiale ligne par ligne** : les mots sont regroupés
+  par coordonnée Y (centre du mot), ce qui fusionne correctement les colonnes d'un tableau
+  en lignes cohérentes — au lieu de lire colonne par colonne
+- Fallback sur OCR multi-PSM (3, 4, 6) si la reconstruction spatiale échoue
+
+#### Assemblage
+Le texte de chaque page combine le texte des zones Hailo (paragraphes) et le texte des
+tableaux, balisé par des marqueurs :
+
+```
+--- Page 2 ---
+Texte courant extrait par Hailo + Tesseract…
+
+[TABLEAU DETECTE]
+Latrecey-Ormoy-sur-    Vaudry    ZW    22    4ha09a20c
+TOTAL DE LA SURFACE SOUS CONVENTION    4 ha 09 a 20 ca
+[FIN TABLEAU]
+```
+
+#### Autres traitements
+- OCR multi-passes avec Tesseract (2 variantes d'image × 3 configs PSM) en mode sans Hailo
 - Nettoyage automatique du bruit OCR (artefacts de sidebar, logos, rafales de lignes courtes)
 - Exclusion configurable de pages inutiles (annexes, plans, cartes) via `config/skip_pages.txt`
 - Chronométrage intégré du temps de traitement
 
-### Extraction de métadonnées
+### Extraction de métadonnées (première passe — regex)
 - Code site, type d'acte et date depuis le nom de fichier (ex : `52003_BE_19900817.pdf`)
 - Détection du type de document dans le texte (bail emphytéotique, convention de gestion…)
 - Extraction de la commune avec nettoyage des artefacts OCR
-- Extraction des parcelles cadastrales (tableaux, listes compactes type `B132 / B133 / ZS10`)
+- Extraction des parcelles cadastrales :
+  - Contexte tabulaire : les blocs `[TABLEAU DETECTE]` activent l'extraction ligne par ligne
+  - Pré-validation qualité : les blocs de bruit OCR (cartes, photos) sont automatiquement écartés
+  - Formats reconnus : tableaux (section + numéro), préfixe commune (`078 ZA 265`),
+    listes compactes (`B132 / B133 / ZS10`), listes virgule/et (`ZA1, ZA3 et BS55`),
+    prose notariale (`parcelle cadastrée A 38`)
+
+### Deuxième passe — validation par LLM (prochaine étape)
+L'extraction regex est fragile face à la variété des actes fonciers (formats changeants selon
+les notaires, les années, les départements). Le pipeline est conçu pour alimenter un modèle
+de langage local (Ollama) en deuxième passe :
+
+```
+Pi 5 + Hailo                          Serveur Ollama (CPU Xeon)
+┌──────────────┐                      ┌──────────────────┐
+│ PDF          │                      │ Ollama           │
+│  → Hailo NPU │  texte OCR + crops   │  gemma3:12b      │
+│  → Tesseract │ ────────────────────→ │  (vision)        │
+│  → OpenCV    │                      │                  │
+│  → crops     │  ← JSON structuré    │  raisonnement    │
+└──────────────┘                      └──────────────────┘
+```
+
+- Le texte OCR brut + les **crops d'images** (paragraphes Hailo + tableaux OpenCV) sont
+  envoyés à un LLM vision (ex : `gemma3:12b`) via l'API compatible OpenAI d'Ollama
+- Le LLM raisonne sur le contenu et retourne un JSON structuré (commune, parcelles, surfaces…)
+- La validation IGN reste en troisième passe pour confirmer l'existence des parcelles
 
 ### Validation IGN
 - Validation du nom de commune via l'API geo.api.gouv.fr (fuzzy matching + code INSEE)
@@ -94,14 +160,15 @@ Dépendances Python supplémentaires (installées automatiquement) :
 │   └── ocr_hailo/
 │       ├── cli.py              # Interface CLI (typer)
 │       ├── diagnostics.py      # Diagnostic environnement
-│       ├── extraction.py       # Pipeline OCR (Tesseract + OpenCV)
+│       ├── extraction.py       # Pipeline OCR (Hailo NPU + Tesseract + OpenCV)
 │       ├── geo_api.py          # Client API IGN / geo.api.gouv.fr
-│       ├── metadata.py         # Extraction métadonnées métier
+│       ├── hailo_ocr.py        # Détection de zones de texte via Hailo NPU (PaddleOCR v5)
+│       ├── metadata.py         # Extraction métadonnées métier (regex)
 │       └── table_detection.py  # Détection de tableaux (OpenCV morphologie)
 ├── tests/
 │   ├── test_diagnostics.py
 │   ├── test_extraction.py
-│   └── test_metadata.py       # 7 tests (parcelles, commune, type de doc)
+│   └── test_metadata.py       # 11 tests (parcelles, commune, type de doc)
 ├── Makefile
 ├── pyproject.toml
 └── README.md
@@ -149,9 +216,10 @@ PYTHONPATH=src .venv/bin/pytest tests/ -v
 ```
 
 ## Prochaines étapes
-1. Exploiter le Hailo AI HAT+ pour la détection de layout documentaire (nécessite un modèle compilé sur x86)
-2. Étape de toilettage par modèle local via LM Studio / Ollama (séparée du cœur OCR)
+1. ~~Exploiter le Hailo AI HAT+ pour la détection de layout documentaire~~ ✅ Fait — crops de paragraphes via Hailo NPU
+2. Deuxième passe LLM via Ollama (serveur dédié, modèle vision `gemma3:12b`) pour l'extraction structurée des métadonnées
 3. Traitement batch de dossiers complets
+4. Évaluation de PaddleOCR v5 Mobile Recognition sur Hailo (remplacement de Tesseract pour la reconnaissance de caractères)
 
 ## Notes techniques — Hailo AI HAT+
 
