@@ -10,6 +10,31 @@ import pytesseract
 
 from ocr_hailo.table_detection import detect_table_regions, remove_table_lines
 
+# Import optionnel du module Hailo (peut ne pas être disponible sur toutes les machines)
+try:
+    from ocr_hailo.hailo_ocr import detect_text_regions, extract_text_zone_images, draw_detections
+    _HAILO_AVAILABLE = True
+except (ImportError, OSError):
+    _HAILO_AVAILABLE = False
+
+
+def _is_digital_text_usable(pdf_path: str | Path) -> bool:
+    """Vérifie si le texte numérique d'un PDF est fiable.
+
+    Un scan PDF avec couche OCR embarquée (mauvaise qualité) contient
+    une image pleine page + du texte dégradé. On le détecte en vérifiant
+    si la majorité des pages contiennent des images : si oui, c'est un
+    scan déguisé et le texte natif n'est pas fiable.
+    """
+    reader = PdfReader(str(pdf_path))
+    if not reader.pages:
+        return False
+    pages_with_images = sum(
+        1 for p in reader.pages if hasattr(p, "images") and len(p.images) > 0
+    )
+    # Si plus de la moitié des pages contiennent des images → scan déguisé
+    return pages_with_images <= len(reader.pages) // 2
+
 
 def extract_digital_text(pdf_path: str | Path) -> str:
     """Extrait le texte présent nativement dans un PDF."""
@@ -173,12 +198,161 @@ def _ocr_page(image: Image.Image, language: str = "fra") -> tuple[str, list[str]
     return unique_candidates[0], unique_candidates
 
 
+def _boxes_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int], threshold: float = 0.5) -> bool:
+    """Vérifie si la box 'a' chevauche la box 'b' au-delà du seuil (ratio de l'aire de 'a')."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix0 = max(ax, bx)
+    iy0 = max(ay, by)
+    ix1 = min(ax + aw, bx + bw)
+    iy1 = min(ay + ah, by + bh)
+    if ix1 <= ix0 or iy1 <= iy0:
+        return False
+    inter = (ix1 - ix0) * (iy1 - iy0)
+    return inter / (aw * ah) >= threshold
+
+
+def _ocr_zones_hailo(
+    image: Image.Image,
+    language: str = "fra",
+    debug_dir: Path | None = None,
+    page_index: int = 0,
+    exclude_regions: list[tuple[int, int, int, int]] | None = None,
+) -> str:
+    """OCR guidé par la détection de zones de texte Hailo NPU.
+
+    Détecte les zones de texte via le Hailo, découpe chaque zone,
+    puis lance Tesseract sur chaque zone individuellement.
+    Les zones qui chevauchent les régions exclues (tableaux) sont ignorées.
+    Les résultats sont assemblés dans l'ordre de lecture (haut→bas, gauche→droite).
+    """
+    boxes, _ = detect_text_regions(image, threshold=0.3, min_area=500)
+    if not boxes:
+        return ""
+
+    # Filtrer les zones trop petites (bruit : points, traits, caractères isolés)
+    MIN_W, MIN_H = 250, 60
+    boxes = [(x, y, w, h) for x, y, w, h in boxes if w >= MIN_W and h >= MIN_H]
+
+    # Exclure les zones qui chevauchent les tableaux détectés
+    if exclude_regions:
+        boxes = [
+            box for box in boxes
+            if not any(_boxes_overlap(box, tr) for tr in exclude_regions)
+        ]
+
+    if not boxes:
+        return ""
+
+    # Mode debug : sauvegarder l'image annotée et les crops
+    if debug_dir is not None:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        annotated = draw_detections(image, boxes)
+        annotated.save(debug_dir / f"page{page_index}_detections.png")
+
+    crops = extract_text_zone_images(image, boxes, padding=10)
+    parts: list[str] = []
+    for i, crop in enumerate(crops, start=1):
+        if debug_dir is not None:
+            crop.save(debug_dir / f"page{page_index}_zone{i:02d}.png")
+
+        # Préparer l'image de la zone pour Tesseract
+        gray = ImageOps.grayscale(crop)
+        gray = ImageOps.autocontrast(gray)
+        if gray.width < 600:
+            gray = gray.resize(
+                (gray.width * 2, gray.height * 2), Image.Resampling.LANCZOS
+            )
+        sharp = gray.filter(ImageFilter.SHARPEN)
+        text = pytesseract.image_to_string(
+            sharp, lang=language,
+            config="--oem 1 --psm 6 -c preserve_interword_spaces=1",
+        ).strip()
+        if text:
+            parts.append(text)
+
+    return "\n\n".join(parts)
+
+
+def _ocr_table_layout(image: Image.Image, language: str = "fra") -> str:
+    """Reconstruction spatiale par coordonnées Y, optimisée pour les tableaux.
+
+    Contrairement à _ocr_page_layout qui suit le groupage block/par/line de Tesseract,
+    cette fonction regroupe les mots purement par position verticale (centre du mot).
+    Cela fusionne les colonnes d'un tableau en lignes cohérentes.
+    """
+    data = pytesseract.image_to_data(
+        image, lang=language, config="--oem 1 --psm 6",
+        output_type=pytesseract.Output.DICT,
+    )
+
+    n = len(data["text"])
+    words: list[tuple[int, int, int, int, str]] = []  # (top, h, left, right, text)
+    for i in range(n):
+        txt = data["text"][i].strip()
+        if not txt or int(data["conf"][i]) < 20:
+            continue
+        top = data["top"][i]
+        h = data["height"][i]
+        left = data["left"][i]
+        right = left + data["width"][i]
+        words.append((top, h, left, right, txt))
+
+    if not words:
+        return ""
+
+    # Tolérance adaptative : demi-hauteur médiane des mots
+    heights = sorted(w[1] for w in words)
+    median_h = heights[len(heights) // 2]
+    row_tol = max(median_h // 2, 10)
+
+    # Tri par centre Y puis X
+    words.sort(key=lambda w: (w[0] + w[1] // 2, w[2]))
+
+    # Regroupement en lignes par centre Y
+    rows: list[list[tuple[int, int, int, int, str]]] = []
+    row: list[tuple[int, int, int, int, str]] = [words[0]]
+    row_center = words[0][0] + words[0][1] // 2
+
+    for w in words[1:]:
+        w_center = w[0] + w[1] // 2
+        if abs(w_center - row_center) <= row_tol:
+            row.append(w)
+        else:
+            rows.append(row)
+            row = [w]
+            row_center = w_center
+    rows.append(row)
+
+    # Construction du texte ligne par ligne
+    lines: list[str] = []
+    for row_words in rows:
+        row_words.sort(key=lambda w: w[2])
+        parts: list[str] = []
+        prev_right = 0
+        for _top, _h, left, right, txt in row_words:
+            if prev_right > 0:
+                gap = left - prev_right
+                parts.append("    " if gap > 40 else " ")
+            parts.append(txt)
+            prev_right = right
+        lines.append("".join(parts))
+
+    return "\n".join(lines)
+
+
 def _ocr_table_image(image: Image.Image, language: str = "fra") -> str:
     """OCR optimisé pour une image de tableau dont les bordures ont été effacées."""
     gray = ImageOps.grayscale(image) if image.mode != "L" else image
     gray = ImageOps.autocontrast(gray)
     sharp = gray.filter(ImageFilter.SHARPEN)
 
+    # Reconstruction spatiale par coordonnées Y (prioritaire pour les tableaux)
+    layout_text = _ocr_table_layout(sharp, language)
+    if layout_text and len(layout_text.strip()) > 20:
+        return layout_text
+
+    # Fallback : PSM classiques si la reconstruction spatiale échoue
     best_text = ""
     best_score = (-1,)
     for psm in [3, 4, 6]:
@@ -189,6 +363,7 @@ def _ocr_table_image(image: Image.Image, language: str = "fra") -> str:
             if score > best_score:
                 best_score = score
                 best_text = text
+
     return best_text
 
 
@@ -235,8 +410,23 @@ def _is_skip_page(image: Image.Image, language: str = "fra") -> str | None:
     return None
 
 
-def ocr_scanned_pdf(pdf_path: str | Path, language: str = "fra", return_analysis: bool = False) -> str | tuple[str, str]:
-    """OCR fallback pour un PDF scanné via Poppler + Tesseract."""
+def ocr_scanned_pdf(
+    pdf_path: str | Path,
+    language: str = "fra",
+    return_analysis: bool = False,
+    use_hailo: bool | None = None,
+    debug: bool = False,
+) -> str | tuple[str, str]:
+    """OCR fallback pour un PDF scanné via Poppler + Tesseract.
+
+    Args:
+        use_hailo: Active la détection de zones de texte via le Hailo NPU.
+            None = auto-détection (True si le Hailo est disponible).
+            Le mode Hailo détecte d'abord les zones de texte (rapide),
+            puis lance Tesseract sur chaque zone individuellement.
+        debug: Sauvegarde les crops et l'image annotée dans input/crops/{pdf_stem}/.
+    """
+    hailo_enabled = _HAILO_AVAILABLE if use_hailo is None else (use_hailo and _HAILO_AVAILABLE)
     images = convert_from_path(str(pdf_path), dpi=400)
     blocks: list[str] = []
     analysis_blocks: list[str] = []
@@ -244,6 +434,7 @@ def ocr_scanned_pdf(pdf_path: str | Path, language: str = "fra", return_analysis
     # Répertoire temporaire pour les tables extraites
     pdf_stem = Path(pdf_path).stem
     table_dir = Path(pdf_path).parent / "tables" / pdf_stem
+    debug_dir = Path(pdf_path).parent / "crops" / pdf_stem if debug else None
 
     for index, image in enumerate(images, start=1):
         # Pré-détection rapide → ignorer les pages inutiles (annexes, plans, cartes…)
@@ -252,13 +443,12 @@ def ocr_scanned_pdf(pdf_path: str | Path, language: str = "fra", return_analysis
             blocks.append(f"--- Page {index} --- [PAGE IGNORÉE : « {skip_reason} » détecté]")
             continue
 
-        # Détecter les tableaux dans la page
+        # Détecter les tableaux dans la page (toujours, même en mode Hailo)
         table_regions = detect_table_regions(image)
+        table_texts: list[str] = []
 
         if table_regions:
-            # Page avec tableau : OCR séparé pour les zones table vs hors-table
             table_dir.mkdir(parents=True, exist_ok=True)
-            table_texts: list[str] = []
 
             for t_idx, (x, y, cw, ch) in enumerate(table_regions, 1):
                 padding = 20
@@ -275,36 +465,41 @@ def ocr_scanned_pdf(pdf_path: str | Path, language: str = "fra", return_analysis
                 if table_text:
                     table_texts.append(table_text)
 
-            # OCR du reste de la page (sans la zone tableau)
-            text, candidates = _ocr_page(image, language=language)
-            cleaned_text = _clean_ocr_text(text) if text else ""
-
-            # Assembler : texte de page + texte de table en section dédiée
-            page_parts = []
-            if cleaned_text:
-                page_parts.append(cleaned_text)
-            for t_text in table_texts:
-                page_parts.append(f"[TABLEAU DETECTE]\n{t_text}\n[FIN TABLEAU]")
-
-            if page_parts:
-                blocks.append(f"--- Page {index} ---\n" + "\n\n".join(page_parts))
-
-            # Pour l'analyse, combiner tous les candidats
-            all_analysis = []
-            if candidates:
-                all_analysis.extend(candidates[:2])
-            all_analysis.extend(table_texts)
-            if all_analysis:
-                analysis_blocks.append(f"--- Page {index} ---\n" + "\n\n".join(all_analysis))
+        # OCR du texte hors-tableau : Hailo si disponible, sinon pipeline classique
+        if hailo_enabled:
+            hailo_text = _ocr_zones_hailo(
+                image, language, debug_dir=debug_dir, page_index=index,
+                exclude_regions=table_regions or [],
+            )
+            if hailo_text:
+                page_text = _clean_ocr_text(hailo_text)
+            else:
+                page_text = ""
+            raw_text = hailo_text
         else:
-            # Page sans tableau : pipeline standard
             text, candidates = _ocr_page(image, language=language)
-            if text:
-                blocks.append(f"--- Page {index} ---\n{_clean_ocr_text(text)}")
-            if candidates:
-                top_candidates = candidates[:3]
-                merged_candidates = "\n\n".join(top_candidates)
-                analysis_blocks.append(f"--- Page {index} ---\n{merged_candidates}")
+            page_text = _clean_ocr_text(text) if text else ""
+            raw_text = text
+
+        # Assembler : texte de page + texte de table en section dédiée
+        page_parts = []
+        if page_text:
+            page_parts.append(page_text)
+        for t_text in table_texts:
+            page_parts.append(f"[TABLEAU DETECTE]\n{t_text}\n[FIN TABLEAU]")
+
+        if page_parts:
+            blocks.append(f"--- Page {index} ---\n" + "\n\n".join(page_parts))
+
+        # Analyse
+        analysis_parts = []
+        if raw_text:
+            analysis_parts.append(raw_text)
+        if not hailo_enabled and not raw_text and candidates:
+            analysis_parts.extend(candidates[:2])
+        analysis_parts.extend(table_texts)
+        if analysis_parts:
+            analysis_blocks.append(f"--- Page {index} ---\n" + "\n\n".join(analysis_parts))
 
     result = "\n\n".join(blocks).strip()
     analysis_text = "\n\n".join(analysis_blocks).strip() or result
@@ -314,15 +509,21 @@ def ocr_scanned_pdf(pdf_path: str | Path, language: str = "fra", return_analysis
     return result
 
 
-def process_pdf(pdf_path: str | Path, language: str = "fra", return_analysis: bool = False) -> str | tuple[str, str]:
+def process_pdf(
+    pdf_path: str | Path,
+    language: str = "fra",
+    return_analysis: bool = False,
+    use_hailo: bool | None = None,
+    debug: bool = False,
+) -> str | tuple[str, str]:
     """Privilégie le texte natif puis bascule sur l'OCR si nécessaire."""
     digital_text = extract_digital_text(pdf_path)
-    if digital_text:
+    if digital_text and _is_digital_text_usable(pdf_path):
         if return_analysis:
             return digital_text, digital_text
         return digital_text
 
-    return ocr_scanned_pdf(pdf_path, language=language, return_analysis=return_analysis)
+    return ocr_scanned_pdf(pdf_path, language=language, return_analysis=return_analysis, use_hailo=use_hailo, debug=debug)
 
 
 def write_text_output(text: str, output_path: str | Path) -> Path:

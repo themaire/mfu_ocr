@@ -189,7 +189,9 @@ def verify_parcelles_batch(
     for p in parcelles:
         result = verify_parcelle(code_insee, p["section"], p["number"])
         if result:
-            verified.append({**p, "ign_verified": True, **result})
+            # Ne pas écraser section/number originaux avec le format IGN (ex: "0A")
+            ign_extra = {k: v for k, v in result.items() if k not in ("section", "numero")}
+            verified.append({**p, "ign_verified": True, **ign_extra})
         else:
             verified.append({**p, "ign_verified": False})
     return verified

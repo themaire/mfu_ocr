@@ -7,5 +7,11 @@
     "**/__pycache__": true,
     "**/.pytest_cache": true,
     "**/.ruff_cache": true
+  },
+  "chat.tools.terminal.autoApprove": {
+    "/^python3 -c \"\nfrom ocr_hailo\\.metadata import extract_cadastral_parcels\ntext = open\\('/home/nico/Documents/ia_hat/ocr/output/52003_CG\\.txt'\\)\\.read\\(\\)\nresult = extract_cadastral_parcels\\(text\\)\nprint\\(f'\\{len\\(result\\)\\} parcelles'\\)\nfor p in result:\n    print\\(f'  \\{p\\[\\\\\"section\\\\\"\\]\\} \\{p\\[\\\\\"number\\\\\"\\]\\}'\\)\n\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    }
   }
 }

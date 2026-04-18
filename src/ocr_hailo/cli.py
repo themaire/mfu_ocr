@@ -51,10 +51,12 @@ def process_pdf_command(
     output_path: Path = typer.Option(Path("output/resultat.txt"), "--output", "-o", help="Fichier texte de sortie"),
     language: str = typer.Option("fra", "--lang", "-l", help="Langue Tesseract à utiliser"),
     json_output_path: Path | None = typer.Option(None, "--json-output", help="Fichier JSON de synthèse"),
+    hailo: bool | None = typer.Option(None, "--hailo/--no-hailo", help="Activer/désactiver la détection de texte via Hailo NPU (auto par défaut)"),
+    debug: bool = typer.Option(False, "--debug", help="Sauvegarder les crops Hailo dans input/crops/{pdf}/"),
 ) -> None:
     """Traite un PDF hybride : texte natif si possible, OCR sinon."""
     t0 = time.monotonic()
-    text, analysis_text = process_pdf(pdf_path, language=language, return_analysis=True)
+    text, analysis_text = process_pdf(pdf_path, language=language, return_analysis=True, use_hailo=hailo, debug=debug)
     if not text:
         console.print("[red]Aucun texte n'a pu être extrait du document.[/red]")
         raise typer.Exit(code=1)

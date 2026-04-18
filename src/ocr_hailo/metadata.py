@@ -142,17 +142,23 @@ def extract_cadastral_parcels(text: str) -> list[dict[str, str]]:
     parcels: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
 
-    def add_parcel(section_value: str, number_value: str) -> None:
+    # Sections invalides pour le parsing général (mots courants, unités de surface)
+    _INVALID_SECTIONS = {
+        "A", "HA", "CA", "DE", "DU", "LE", "LA", "LES", "ET", "N", "NO",
+        "PAGE", "SUR", "OHA", "HAO", "TOTAL", "ART", "ANNEXE",
+        "OS", "SE", "SI", "BAS", "JZS", "PETE", "DES", "PAR", "EST",
+    }
+    # En contexte fiable (après "parcelle cadastrée", début de ligne tabulaire),
+    # seules les unités de surface restent interdites.
+    _INVALID_SECTIONS_TRUSTED = {"HA", "CA"}
+
+    def add_parcel(section_value: str, number_value: str, *, trusted: bool = False) -> None:
         section = _normalize_label(section_value)
         number = _normalize_label(number_value)
-        invalid_sections = {
-            "A", "HA", "CA", "DE", "DU", "LE", "LA", "LES", "ET", "N", "NO",
-            "PAGE", "SUR", "OHA", "HAO", "TOTAL", "ART", "ANNEXE",
-            "OS", "SE", "SI", "BAS", "JZS", "PETE", "DES", "PAR", "EST",
-        }
-        if section in invalid_sections:
+        invalid = _INVALID_SECTIONS_TRUSTED if trusted else _INVALID_SECTIONS
+        if section in invalid:
             return
-        if not re.fullmatch(r"[0-9]+", number):
+        if not re.fullmatch(r"[0-9]+", number) or number == "0":
             return
         key = (section, number)
         if key in seen:
@@ -164,27 +170,82 @@ def extract_cadastral_parcels(text: str) -> list[dict[str, str]]:
         for match in re.finditer(pattern, text, flags=re.IGNORECASE):
             add_parcel(match.group(1), match.group(2))
 
+    # "parcelle cadastrée A 38" — format notarié sans le mot "SECTION"
+    for match in re.finditer(
+        r"PARCELL\w*\s+CADASTR\w*\s+([A-Z]{1,3})\s+(\d{1,4})\b",
+        text, flags=re.IGNORECASE,
+    ):
+        add_parcel(match.group(1), match.group(2), trusted=True)
+
     normalized_lines = [_normalize_for_matching(line) for line in text.splitlines()]
+
+    # Pré-scanner les blocs [TABLEAU DETECTE]...[FIN TABLEAU] pour identifier
+    # ceux qui contiennent du vrai texte (pas juste du bruit OCR de cartes/photos).
+    # Critère : la moyenne de caractères alphanumériques par ligne non-vide
+    # doit être >= 8 (les vrais tableaux ont des lignes riches, le bruit a
+    # des lignes de 1-3 caractères parsemées de symboles).
+    _valid_table_starts: set[int] = set()
+    for idx, nline in enumerate(normalized_lines):
+        if nline == "TABLEAU DETECTE":
+            alnum_counts: list[int] = []
+            for j in range(idx + 1, min(idx + 200, len(normalized_lines))):
+                if normalized_lines[j] == "FIN TABLEAU":
+                    break
+                stripped = normalized_lines[j].strip()
+                if not stripped:
+                    continue
+                alnum_counts.append(sum(c.isalnum() for c in stripped))
+            if alnum_counts:
+                avg_alnum = sum(alnum_counts) / len(alnum_counts)
+                if avg_alnum >= 8:
+                    _valid_table_starts.add(idx)
+
     table_context = False
+    in_table_block = False
     blank_streak = 0
 
-    for line in normalized_lines:
-        if "REFERENCE CADASTRALE" in line or "REFERENCES CADASTRALES" in line:
-            table_context = True
+    for line_idx, line in enumerate(normalized_lines):
+        # Bloc [TABLEAU DETECTE]...[FIN TABLEAU] = table_context si contenu valide
+        if line == "TABLEAU DETECTE":
+            in_table_block = True
+            table_context = line_idx in _valid_table_starts
             blank_streak = 0
             continue
 
-        if "SECTION" in line and "PARCELLE" in line:
-            table_context = True
-            blank_streak = 0
-            continue
-
-        if "TOTAL DE LA SURFACE" in line:
+        if line == "FIN TABLEAU":
+            in_table_block = False
             table_context = False
             blank_streak = 0
             continue
 
-        if table_context and not line.strip():
+        # Triggers textuels hors bloc tableau
+        if not in_table_block:
+            if "REFERENCE CADASTRALE" in line or "REFERENCES CADASTRALES" in line:
+                table_context = True
+                blank_streak = 0
+                continue
+
+            if "SECTION" in line and ("PARCELLE" in line or "NUMERO" in line):
+                table_context = True
+                blank_streak = 0
+                continue
+
+            if "N°" in line and "PARCELLE" in line:
+                table_context = True
+                blank_streak = 0
+                continue
+
+            if "FIGURANT AU CADASTRE" in line:
+                table_context = True
+                blank_streak = 0
+                continue
+
+        if "TOTAL DE LA SURFACE" in line or "CONTENANCE TOTALE" in line or "SURFACE TOTALE" in line:
+            table_context = False
+            blank_streak = 0
+            continue
+
+        if table_context and not in_table_block and not line.strip():
             blank_streak += 1
             if blank_streak >= 2:
                 table_context = False
@@ -192,18 +253,35 @@ def extract_cadastral_parcels(text: str) -> list[dict[str, str]]:
 
         blank_streak = 0
 
-        if table_context and (line.startswith("ARTICLE ") or line.startswith("ANNEXE ")):
+        if table_context and not in_table_block and line.startswith("ARTICLE "):
             table_context = False
             continue
 
         if table_context:
-            for match in re.finditer(r"\b([A-Z]{1,4})\s+([0-9]{1,4}[A-Z]?)\b", line):
-                add_parcel(match.group(1), match.group(2))
+            # Lignes tabulaires : section + numéro en début de ligne (ex: "A 38 LES TRIOTS...")
+            # Contexte fiable → autorise les sections courtes comme "A"
+            start_match = re.match(r"\s*([A-Z]{1,3})\s+(\d{1,4})\s+[A-Z]", line)
+            if start_match:
+                add_parcel(start_match.group(1), start_match.group(2), trusted=True)
 
-            compact_tokens = re.findall(r"\b[A-Z]{1,4}\b|\b[0-9]{1,4}[A-Z]?\b", line)
-            for left, right in zip(compact_tokens, compact_tokens[1:]):
-                if re.fullmatch(r"[A-Z]{1,4}", left) and re.fullmatch(r"[0-9]{1,4}[A-Z]?", right):
-                    add_parcel(left, right)
+            # Section avec préfixe commune (ex: "078 ZA 265" → section ZA, numéro 265)
+            # Utilise re.search pour trouver le pattern au milieu d'une ligne (layout ligne par ligne)
+            # Lookahead négatif pour exclure les surfaces décimales (ex: "ZA 15,6790")
+            # Sections de 2+ lettres : les sections 1 lettre ne sont jamais préfixées du code commune
+            prefix_match = re.search(
+                r"\b\d{2,3}\s+([A-Z]{2,3})\s+(\d{1,4})(?![,\.]\d)", line
+            )
+            if prefix_match:
+                add_parcel(prefix_match.group(1), prefix_match.group(2), trusted=True)
+
+            # Pattern général section + numéro (ex: "ZW 22", "AV 365")
+            # Lookahead négatif pour exclure les surfaces décimales
+            # Dans un bloc tableau, exiger section de 2+ lettres pour éviter le bruit OCR
+            min_sect = 2 if in_table_block else 1
+            for match in re.finditer(
+                rf"\b([A-Z]{{{min_sect},3}})\s+([0-9]{{1,4}}[A-Z]?)\b(?![,\.]\d)", line
+            ):
+                add_parcel(match.group(1), match.group(2))
 
     # --- Listes compactes de références (ex: "B132 / B133 / ZS10 et ZS19") ---
     flat_text = re.sub(r"\s+", " ", text)
@@ -215,6 +293,16 @@ def extract_cadastral_parcels(text: str) -> list[dict[str, str]]:
     for list_match in re.finditer(list_pattern, flat_text, re.IGNORECASE):
         for ref in re.finditer(r"([A-Z]{1,3})(\d{1,4})", list_match.group(0), re.IGNORECASE):
             add_parcel(ref.group(1).upper(), ref.group(2))
+
+    # --- Listes compactes séparées par virgules (ex: "parcelles ZA1, ZA3 et BS55") ---
+    comma_list_pattern = (
+        r"[A-Z]{1,3}\d{1,4}"
+        r"(?:\s*,\s*[A-Z]{1,3}\d{1,4})+"
+        r"(?:\s+et\s+[A-Z]{1,3}\d{1,4})?"
+    )
+    for list_match in re.finditer(comma_list_pattern, flat_text, re.IGNORECASE):
+        for ref in re.finditer(r"([A-Z]{1,3})(\d{1,4})", list_match.group(0), re.IGNORECASE):
+            add_parcel(ref.group(1).upper(), ref.group(2), trusted=True)
 
     return parcels
 
