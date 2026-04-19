@@ -77,5 +77,17 @@ def process_pdf_command(
     console.print(f"[green]Synthèse JSON :[/green] {json_target}")
 
 
+@app.command("serve")
+def serve(
+    host: str = typer.Option("0.0.0.0", "--host", "-h", help="Adresse d'écoute"),
+    port: int = typer.Option(5000, "--port", "-p", help="Port d'écoute"),
+    debug: bool = typer.Option(False, "--debug", help="Mode debug Flask"),
+) -> None:
+    """Démarre le serveur API Flask."""
+    from .api import app as flask_app
+    console.print(f"[green]Serveur API démarré sur http://{host}:{port}[/green]")
+    flask_app.run(host=host, port=port, debug=debug)
+
+
 if __name__ == "__main__":
     app()

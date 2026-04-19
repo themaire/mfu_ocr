@@ -125,6 +125,94 @@ cat output/52003_BE.json
 grep -ni "cadastr\|section" output/52003_BE.txt
 ```
 
+### 5) Lancer le serveur API Flask
+```bash
+source .venv/bin/activate
+PYTHONPATH=src python -m ocr_hailo.api
+```
+Le serveur démarre sur `http://0.0.0.0:5000` par défaut.
+
+On peut aussi le lancer via le CLI :
+```bash
+PYTHONPATH=src .venv/bin/python -m ocr_hailo.cli serve
+```
+
+## API HTTP (Flask)
+
+Le serveur expose le pipeline OCR via des routes HTTP, permettant à un LLM ou tout autre
+client de déclencher un traitement et de récupérer les fichiers générés.
+
+### Routes disponibles
+
+#### `GET /process?pdf=<nom_du_fichier.pdf>`
+Lance le traitement OCR sur un PDF situé dans `./input/`.
+
+**Paramètres GET :**
+| Paramètre | Défaut | Description |
+|-----------|--------|-------------|
+| `pdf` | *(obligatoire)* | Nom du fichier PDF dans `./input/` |
+| `lang` | `fra` | Langue Tesseract |
+| `hailo` | auto | `true` / `false` pour forcer l'utilisation du Hailo NPU |
+| `debug` | `false` | `true` pour sauvegarder les crops de détection |
+
+**Exemple :**
+```bash
+curl "http://localhost:5000/process?pdf=52003_CG_20151228.pdf&debug=true"
+```
+
+**Réponse JSON :**
+```json
+{
+  "status": "ok",
+  "pdf": "52003_CG_20151228.pdf",
+  "is_native": false,
+  "duration": "1m23.45s",
+  "output_txt": "/files/output/52003_CG_20151228.txt",
+  "output_json": "/files/output/52003_CG_20151228.json",
+  "metadata": { "site_code": "52003", "commune": "...", "cadastral_parcels": [...] },
+  "crops": [
+    "/files/crops/52003_CG_20151228/page1_detections.png",
+    "/files/crops/52003_CG_20151228/page1_zone01.png"
+  ],
+  "tables": [
+    "/files/tables/52003_CG_20151228/page1_table1.png"
+  ]
+}
+```
+
+- `is_native` : `true` si le PDF contenait du texte numérique (pas de scan/OCR nécessaire)
+- Les URLs sont des chemins relatifs au serveur : `http://<IP>:5000/files/output/...`
+
+#### `GET /results`
+Liste tous les PDF déjà traités avec leurs fichiers de sortie (txt, json, crops, tables).
+
+```bash
+curl http://localhost:5000/results
+```
+
+Chaque fichier contient : `filename`, `url`, `type` (`text`, `json`, `crop`, `table`) et `size` (octets).
+
+#### `GET /files/output/<filename>`
+Télécharge un fichier de sortie (`.txt` ou `.json`).
+
+#### `GET /files/crops/<stem>/<filename>`
+Télécharge une image crop (zone de texte détectée par Hailo).
+
+#### `GET /files/tables/<stem>/<filename>`
+Télécharge une image de tableau (détecté par OpenCV).
+
+#### `GET /health`
+Vérification que le serveur est opérationnel.
+
+#### `GET /` — Documentation API pour IA générative
+Retourne un JSON structuré décrivant l'ensemble de l'API : description du service, liste des
+routes avec leurs paramètres, champs de réponse, exemples et conseils d'utilisation (workflow).
+Pensé pour être consommé directement par un LLM afin qu'il comprenne comment interagir avec le serveur.
+
+```bash
+curl http://localhost:5000/
+```
+
 ## Dépendances système
 ```bash
 sudo apt update
@@ -158,6 +246,7 @@ Dépendances Python supplémentaires (installées automatiquement) :
 │   └── check_env.py
 ├── src/
 │   └── ocr_hailo/
+│       ├── api.py              # Serveur API Flask (routes HTTP)
 │       ├── cli.py              # Interface CLI (typer)
 │       ├── diagnostics.py      # Diagnostic environnement
 │       ├── extraction.py       # Pipeline OCR (Hailo NPU + Tesseract + OpenCV)
